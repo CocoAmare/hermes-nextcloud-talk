@@ -9,10 +9,17 @@ import types
 
 import pytest
 
-import bot.adapter as bot_adapter
 import user.adapter as user_adapter
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Loaded by path under a unique name: tests/bot imports the same file as a flat
+# ``adapter`` module, so a package import would depend on collection order.
+_bspec = importlib.util.spec_from_file_location(
+    "nctalk_bot_adapter_unscoped", os.path.join(_ROOT, "bot", "adapter.py")
+)
+bot_adapter = importlib.util.module_from_spec(_bspec)
+_bspec.loader.exec_module(bot_adapter)
 
 
 class UnscopedSecretError(RuntimeError):
