@@ -13,8 +13,11 @@ combined plugin's (`plugin.yaml` at the repo root).
   `get_secret` raised `UnscopedSecretError` and validation failed with "Hermes
   could not read this profile's NEXTCLOUD_TALK_APP_PASSWORD"; Talk never
   connected. `_secret` in both connectors now catches that one error and reads
-  the profile's own `.env` through `hermes_cli.config.load_env`. Other errors
-  still propagate, and behaviour under a bound scope is unchanged.
+  the default profile's own secrets (`build_profile_secret_scope` over
+  `get_default_hermes_root()`, the profile core serves these adapters for, not
+  the launch home). On a Hermes without those helpers it re-raises, never
+  reading the shared process env. Other errors still propagate, and behaviour
+  under a bound scope is unchanged.
 
 ## [1.13.0] - 2026-10-30
 

@@ -68,6 +68,16 @@ try:  # Hermes resolves credentials per profile scope (multiplexed gateways)
     from agent.secret_scope import get_secret as _hermes_get_secret
 except ImportError:  # pragma: no cover - older Hermes / test stubs
     _hermes_get_secret = None
+try:
+    from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+except ImportError:  # pragma: no cover - older Hermes / test stubs
+    _UnscopedSecretError = None
+
+
+def _is_unscoped(exc: Exception) -> bool:
+    if _UnscopedSecretError is not None:
+        return isinstance(exc, _UnscopedSecretError)
+    return type(exc).__name__ == "UnscopedSecretError"
 
 
 def _secret(name: str, default: str = "") -> str:
@@ -77,12 +87,18 @@ def _secret(name: str, default: str = "") -> str:
             val = _hermes_get_secret(name, default)
         except Exception as exc:
             # Multiplexed gateway with no scope bound (the default profile's adapter
-            # setup): read this profile's own .env, never the shared process env.
-            if type(exc).__name__ != "UnscopedSecretError":
+            # setup). Core serves the default profile's adapters from
+            # get_default_hermes_root(), not the launch home, so read exactly that
+            # profile's secrets. Never read os.environ here, and fail closed (re-raise)
+            # on a Hermes that lacks these helpers.
+            if not _is_unscoped(exc):
                 raise
-            from hermes_cli.config import load_env
-
-            val = load_env().get(name)
+            try:
+                from agent.secret_scope import build_profile_secret_scope
+                from hermes_constants import get_default_hermes_root
+            except ImportError:
+                raise exc
+            val = build_profile_secret_scope(get_default_hermes_root()).get(name)
         return default if val is None else val
     return os.getenv(name, default)
 
