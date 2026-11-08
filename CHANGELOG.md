@@ -4,6 +4,24 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.14.0] - 2026-11-07
+
+### Added
+
+- Threads mode: a per-room switch, off by default, that makes the agent open a
+  Talk thread for each new message a person posts on the main timeline, as it
+  does in group rooms, including in a one-to-one DM. `/threads on`, `/threads
+  off` and `/threads` (status) are handled by the plugin and never forwarded to
+  the Hermes core; only a human the room's access rules allow can change it
+  (agents never can). With it on, the reply is the first message of a new
+  thread titled by the model (a leading `Thread title:` line it is asked for)
+  or, failing that, by the first words of the person's message. Messages
+  already inside a thread, slash commands, polls, reactions, cron delivery and
+  agent-to-agent messages behave as before. A federated room whose host lacks
+  `threads` behaves as off. The setting is stored per profile in
+  `nctalk/threads-mode-<acct>.json`; `NEXTCLOUD_TALK_THREADS_MODE_ROOMS`
+  ("token1,token2") seeds rooms that start on.
+
 ## [1.13.1] - 2026-11-07
 
 ### Fixed
