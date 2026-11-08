@@ -73,7 +73,16 @@ except ImportError:  # pragma: no cover - older Hermes / test stubs
 def _secret(name: str, default: str = "") -> str:
     """Read a credential through Hermes' secret scope, falling back to the env."""
     if _hermes_get_secret is not None:
-        val = _hermes_get_secret(name, default)
+        try:
+            val = _hermes_get_secret(name, default)
+        except Exception as exc:
+            # Multiplexed gateway with no scope bound (the default profile's adapter
+            # setup): read this profile's own .env, never the shared process env.
+            if type(exc).__name__ != "UnscopedSecretError":
+                raise
+            from hermes_cli.config import load_env
+
+            val = load_env().get(name)
         return default if val is None else val
     return os.getenv(name, default)
 
