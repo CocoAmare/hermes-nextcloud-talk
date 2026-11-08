@@ -4,6 +4,21 @@ All notable changes to this project are documented here. Versioning follows
 [Semantic Versioning](https://semver.org/); the version tracked is the
 combined plugin's (`plugin.yaml` at the repo root).
 
+## [1.13.1] - 2026-11-07
+
+### Fixed
+
+- On a multiplexed gateway (`gateway.multiplex_profiles`), Hermes builds the
+  default profile's platform adapters with no secret scope bound, so
+  `get_secret` raised `UnscopedSecretError` and validation failed with "Hermes
+  could not read this profile's NEXTCLOUD_TALK_APP_PASSWORD"; Talk never
+  connected. `_secret` in both connectors now catches that one error and reads
+  the default profile's own secrets (`build_profile_secret_scope` over
+  `get_default_hermes_root()`, the profile core serves these adapters for, not
+  the launch home). On a Hermes without those helpers it re-raises, never
+  reading the shared process env. Other errors still propagate, and behaviour
+  under a bound scope is unchanged.
+
 ## [1.13.0] - 2026-10-30
 
 ### Added
