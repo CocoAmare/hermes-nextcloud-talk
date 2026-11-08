@@ -15,6 +15,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 
 # Loaded by path under a unique name: tests/bot imports the same file as a flat
 # ``adapter`` module, so a package import would depend on collection order.
+if os.path.join(_ROOT, "bot") not in sys.path:
+    sys.path.insert(0, os.path.join(_ROOT, "bot"))
 _bspec = importlib.util.spec_from_file_location(
     "nctalk_bot_adapter_unscoped", os.path.join(_ROOT, "bot", "adapter.py")
 )
