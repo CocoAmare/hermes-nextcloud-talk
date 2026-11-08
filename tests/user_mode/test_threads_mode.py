@@ -373,3 +373,45 @@ def test_ttl_backstop_drops_a_turn_that_never_completes(tmp_path, monkeypatch):
     a._thread_turns[("dm1", "10")]["at"] -= 7200
     _run(a.send("dm1", "late", reply_to="10"))
     assert talk.posts[-1] == {"message": "late", "replyTo": 10} and a._thread_turns == {}
+
+
+# -- round 3: redirect leaves no phantom turn; /threads off clears turns --------
+
+
+def test_redirected_followup_is_not_a_running_turn(tmp_path, monkeypatch):
+    from gateway.platforms.base import ProcessingOutcome
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    ev_a = _ask(a, "taxes", msg_id=10)                       # turn A runs
+    _run(a._on_message("dm1", _msg(11, "chef", "also the car")))  # B folded into A: no hooks for B
+    assert a.handled_events[-1].message_id == "11"
+    # A's titled commentary: B never started, so A is the single running turn
+    _run(a.send("dm1", "Thread title: Taxes\nLooking.", reply_to="10"))
+    assert talk.posts[-1]["threadTitle"] == "Taxes"
+    ev_a.reply_anchor_override = "11"
+    _run(a.on_processing_complete(ev_a, ProcessingOutcome.SUCCESS))
+    a._thread_turns[("dm1", "10")]["done_at"] -= 60
+    a._thread_turns[("dm1", "11")]["done_at"] -= 60
+    _run(a.send("dm1", "Thread title: Nightly report\nAll green."))
+    assert talk.posts[-1] == {"message": "Thread title: Nightly report\nAll green."}  # no thread, as mode off
+    assert not any(k[0] == "dm1" for k in a._thread_turns)
+
+
+def test_never_started_turn_does_not_block_title_attribution(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    _ask(a, "one", msg_id=10)
+    _run(a._on_message("dm1", _msg(11, "chef", "two")))  # armed, never started
+    _run(a.send("dm1", "Thread title: One\nFirst."))
+    assert talk.posts[-1] == {"message": "First.", "threadTitle": "One"}
+
+
+def test_threads_off_clears_armed_turns(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    _ask(a)
+    assert a._thread_turns
+    _run(a._on_message("dm1", _msg(12, "chef", "/threads off")))
+    assert a._thread_turns == {}
+    _run(a.send("dm1", "Thread title: x\nhi", reply_to="10"))
+    assert talk.posts[-1] == {"message": "Thread title: x\nhi", "replyTo": 10}

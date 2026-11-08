@@ -1818,6 +1818,8 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
                 await self.send(token, "I could not save that setting, so it did not change.", metadata=meta)
                 return
             if arg == "off":
+                for k in [k for k in self._thread_turns if k[0] == token]:
+                    self._thread_turns.pop(k, None)
                 reply = "Threads mode is off for this room. I answer on the main timeline again."
             elif usable:
                 reply = ("Threads mode is on for this room. Each new message you post on the main "
@@ -1886,7 +1888,7 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if not has_title:
             return None
         live = [v for v in self._thread_turns.values()
-                if v["key"][0] == chat_id and v.get("done_at") is None]
+                if v["key"][0] == chat_id and v["started"] and v.get("done_at") is None]
         return live[0] if len(live) == 1 else None
 
     async def _armed_send(self, chat_id: str, content: str, reply_to: Optional[str],
@@ -3015,9 +3017,14 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Remove the working-indicator reaction once processing is done, any outcome."""
-        turn = self._thread_turns.get((getattr(event.source, "chat_id", None), str(event.message_id)))
-        if turn is not None:
-            turn["done_at"] = time.time()  # dropped after a short grace (see _prune_turns)
+        chat = getattr(event.source, "chat_id", None)
+        # A follow-up folded into a running turn (busy_input_mode interrupt/redirect) never gets
+        # its own processing hooks: the turn that absorbed it names it, so retire it too.
+        for mid in (event.message_id, getattr(event, "reply_anchor_override", None),
+                    getattr(event, "ledger_message_id", None)):
+            turn = self._thread_turns.get((chat, str(mid))) if mid else None
+            if turn is not None and turn.get("done_at") is None:
+                turn["done_at"] = time.time()  # dropped after a short grace (see _prune_turns)
         if not self._working_reaction:
             return
         chat_id = getattr(event.source, "chat_id", None)
