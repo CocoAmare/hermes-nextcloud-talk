@@ -154,11 +154,11 @@ def test_on_reply_opens_thread_with_model_title(tmp_path, monkeypatch):
 def test_on_reply_fallback_title(tmp_path, monkeypatch):
     a, talk = _adapter(tmp_path, monkeypatch), Talk()
     _on(a, talk)
-    _ask(a, "**Hey** @hermes-bot can you plan my taxes — for this year and next one please")
+    _ask(a, "**Hey** @hermes-bot can you plan my taxes \u2014 for this year and next one please")
     _run(a.send("dm1", "Sure.", reply_to="10"))
     title = talk.posts[-1]["threadTitle"]
     assert title == "Hey can you plan my taxes, for this"
-    assert "—" not in title and "@" not in title
+    assert "\u2014" not in title and "@" not in title
     assert _fallback_title("   ") == "New thread"
 
 
