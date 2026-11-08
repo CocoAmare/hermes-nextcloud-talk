@@ -48,6 +48,10 @@ Environment variables (env wins over config.yaml ``extra``):
                                              (NEXTCLOUD_TALK_AGENT_USERS) as that agent's, where
                                              this account then only answers when @mentioned
                                              (default on)
+    NEXTCLOUD_TALK_THREADS_MODE_ROOMS      "token1,token2": rooms that start with threads mode ON
+                                             (Talk 22+). Default none. A person allowed to configure
+                                             the room switches it with /threads on|off, and that
+                                             choice, stored per profile, beats this seed
     NEXTCLOUD_TALK_DISCOVERY_INTERVAL_SECONDS  Re-discovery interval (default 30)
     NEXTCLOUD_TALK_MAX_ROOMS                Max concurrent per-room poll tasks (default 20)
     NEXTCLOUD_TALK_WORKING_REACTION        Reaction added while a turn is being processed and
@@ -104,11 +108,12 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 
 try:  # package import (plugin and tests both load ``user`` as a package)
-    from . import access, pollstate, textstyle
+    from . import access, pollstate, textstyle, threadsmode
 except ImportError:  # pragma: no cover - loaded as a loose module
     import access  # type: ignore
     import pollstate  # type: ignore
     import textstyle  # type: ignore
+    import threadsmode  # type: ignore
 # Platform id. Not ``nextcloud_talk``: another author's Talk plugin in the
 # Hermes catalog registers that id, and two plugins claiming one id silently
 # replace each other. Env var names keep the NEXTCLOUD_TALK_ prefix.
@@ -290,6 +295,18 @@ THREADS_HINT = (
     "chatter; a message @mentioning someone else never reaches you as a turn."
 )
 THREAD_OWNERSHIP_ENV = "NEXTCLOUD_TALK_THREAD_OWNERSHIP"
+THREADS_MODE_ENV = "NEXTCLOUD_TALK_THREADS_MODE_ROOMS"
+THREAD_TITLE_MAX = 200
+THREAD_FALLBACK_TITLE_WORDS = 8
+THREAD_TURN_TTL = 3600.0       # a pending "reply opens a thread" record is dropped after this
+THREAD_TURN_MAX = 200
+THREAD_DONE_GRACE = 30.0       # a finished turn still answers a reply anchored to it this long
+THREADS_MODE_NOTE = (
+    "[Threads mode is on for this room: your reply to this message opens a new Talk thread. "
+    "Begin your reply with one line `Thread title: <3 to 8 words naming the topic>`; that line "
+    "becomes the thread's title and is not shown. Then answer normally.]"
+)
+_TITLE_LINE = re.compile(r"^\s*[\[*_`]*thread title[\]*_`]*\s*[:=]\s*(.+?)[\]*_`]*\s*$", re.I)
 HOME_THREAD_ENV = "NEXTCLOUD_TALK_HOME_CHANNEL_THREAD_ID"
 THREAD_LOOKUP_RETRY_SECONDS = 300.0  # an unknown thread root is re-read after this
 THREAD_CACHE_MAX = 2000
@@ -533,6 +550,27 @@ def _thread_id_int(raw: Any) -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return value if value > 0 else None
+
+
+def _is_threads_command(text: str) -> bool:
+    head = text.split(None, 1)[0].lower() if text.strip() else ""
+    return head == "/threads"
+
+
+def _clean_title(raw: Any) -> str:
+    """One line, no mentions or markdown, no long dashes, at most THREAD_TITLE_MAX."""
+    t = re.sub(r"@\"[^\"]*\"|@[\w.\-@]+", " ", str(raw or ""))
+    t = re.sub(r"\{mention-[\w-]+\}", " ", t)
+    t = re.sub(r"[*_`#>~\[\]]+", "", t)
+    t = " ".join(t.split())
+    return textstyle.undash(t)[:THREAD_TITLE_MAX].strip()
+
+
+def _fallback_title(human_text: str) -> str:
+    """A title from the first words of the person's message."""
+    words = _clean_title(human_text).split()
+    title = " ".join(words[:THREAD_FALLBACK_TITLE_WORDS])
+    return title[:THREAD_TITLE_MAX].strip() or "New thread"
 
 
 def _ctx_key(token: str, thread_id: Optional[str]):
@@ -1119,6 +1157,16 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if raw_ownership is None:
             raw_ownership = os.getenv(THREAD_OWNERSHIP_ENV, "on")
         self._thread_ownership: bool = str(raw_ownership).strip().lower() not in ("0", "off", "false", "no")
+        # Threads mode (a per-room switch, default off): stored choices beat the env/config seed.
+        self._threads_mode_path = threadsmode.state_path(
+            self._server, self._username, threadsmode.hermes_home())
+        self._threads_mode_seed: frozenset = threadsmode.parse_rooms(
+            extra.get("threads_mode_rooms") or _secret(THREADS_MODE_ENV, ""))
+        # (token, human message id) -> {"text", "name", "tid", "at"}: a main-timeline turn
+        # whose reply opens a thread, and the thread once it exists
+        self._thread_turns: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # (token, thread id) -> the human line a thread we started was opened for
+        self._thread_seed: Dict[Tuple[str, str], str] = {}
         # (token, thread id) -> {"actor": {...} or None, "title", "root", "at"}
         self._threads: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # (token, thread id) pairs whose root was already handed to the model
@@ -1650,6 +1698,11 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # four times 2026-10-24/25).
             event.reply_expected = False
 
+        if is_command and _is_threads_command(text):
+            # Ours, never the core's: it flips this room's threads mode.
+            await self._handle_threads_command(token, thread_id, text, actor, from_agent, room, source)
+            return
+
         if shared_files:
             await self._attach_files(event, shared_files, message)
 
@@ -1669,6 +1722,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # First turn of this thread's session: say what the thread is.
             self._thread_root_given.add(key)
             root = thread.get("root") if thread_id != msg_id else None
+            seed = self._thread_seed.pop(key, None)
+            if seed:
+                root = f"{seed}\n{root}" if root else seed
             if not thread.get("title") and message.get("threadTitle"):
                 thread["title"] = message.get("threadTitle")
             event.text = _with_thread_root(event.text, thread.get("title"), root)
@@ -1689,12 +1745,214 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             # Whoever creates a room writes its description; only rooms the
             # operator listed (or an explicit opt-in) may hand the agent rules.
             event.text = _with_room_rules(event.text, room.get("description"))
+        poll_answer = False
         if not from_agent:
             if thread_id or chat_type == "dm" or self._is_pair_room(token):
                 # Main-timeline chatter in a group room is not an answer to a poll.
+                before_poll = event.text
                 event.text = await self._with_poll_fill_in(token, thread_id, event.text)
+                poll_answer = event.text != before_poll
         event.text = await self._with_capability_note(token, thread_id, chat_type, room, event.text)
+        if not from_agent and not thread_id and not poll_answer:
+            event.text = await self._with_threads_mode(token, msg_id, actor, text, room, event.text)
         await self.handle_message(event)
+
+    # -- Threads mode ---------------------------------------------------------
+
+    def _threads_mode_stored(self, token: str) -> bool:
+        stored = threadsmode.load(self._threads_mode_path)
+        return stored[token] if token in stored else token in self._threads_mode_seed
+
+    def _is_human_actor(self, actor: Dict[str, Optional[str]]) -> bool:
+        """A person: not this account, not a bot, not an agent by either source (the
+        NEXTCLOUD_TALK_AGENT_USERS list or the access file's ``agents:``)."""
+        if self._is_self(actor) or actor.get("type") not in (None, "users", "federated_users"):
+            return False
+        if _is_agent_actor(actor, self._agent_users):
+            return False
+        self._access.reload()
+        return not self._access.is_agent(actor.get("id"))
+
+    def _may_configure(self, actor: Dict[str, Optional[str]], token: str, source: Any) -> bool:
+        if self._sender_allowed(actor.get("id"), token):
+            return True
+        if self._access.source == "file":
+            return False
+        # No access file: the gateway alone decides (it also honors pairing and global grants).
+        check = getattr(getattr(self, "gateway_runner", None), "_is_user_authorized_for_source", None)
+        try:
+            return bool(check(source)) if check and source is not None else False
+        except Exception:
+            return False
+
+    async def _room_has_threads(self, token: str, room: Dict[str, Any]) -> bool:
+        """This server lists ``threads`` and, for a federated room, so does its host."""
+        if not self._threads_enabled:
+            return False
+        if not room.get("remoteServer"):
+            return True
+        return THREADS_CAPABILITY in (await self._room_host_caps(token) or [])
+
+    async def _threads_mode_active(self, token: str, room: Dict[str, Any]) -> bool:
+        return self._threads_mode_stored(token) and await self._room_has_threads(token, room)
+
+    async def _handle_threads_command(
+        self, token: str, thread_id: Optional[str], text: str,
+        actor: Dict[str, Optional[str]], from_agent: bool, room: Dict[str, Any], source: Any = None,
+    ) -> None:
+        """``/threads [on|off]``: only an allowed human may change the room's switch."""
+        if from_agent or not self._is_human_actor(actor):
+            return  # agents and bots never toggle, and nothing is forwarded to the core
+        arg = (text.split(None, 1) + [""])[1].strip().lower()
+        meta = {"thread_id": thread_id} if thread_id else None
+        if not self._may_configure(actor, token, source):
+            await self.send(token, "Only people allowed to configure this room can change threads mode.",
+                            metadata=meta)
+            return
+        usable = await self._room_has_threads(token, room)
+        if arg in ("on", "off"):
+            try:
+                threadsmode.set_room(self._threads_mode_path, token, arg == "on")
+            except OSError as e:
+                logger.warning("[%s] threads mode not saved for %s: %s", self.name, token, e)
+                await self.send(token, "I could not save that setting, so it did not change.", metadata=meta)
+                return
+            if arg == "off":
+                for k in [k for k in self._thread_turns if k[0] == token]:
+                    self._thread_turns.pop(k, None)
+                reply = "Threads mode is off for this room. I answer on the main timeline again."
+            elif usable:
+                reply = ("Threads mode is on for this room. Each new message you post on the main "
+                         "timeline gets its own thread; messages inside a thread stay there.")
+            else:
+                reply = ("Threads mode is on for this room, but "
+                         + ("the server hosting it does not support threads"
+                            if room.get("remoteServer") else "this server does not support threads")
+                         + ", so I behave as if it were off.")
+        elif arg in ("", "status"):
+            on = self._threads_mode_stored(token)
+            reply = f"Threads mode is {'on' if on else 'off'} for this room."
+            if on and not usable:
+                reply += " It has no effect here: threads are not supported."
+        else:
+            reply = "Use /threads on, /threads off, or /threads for the current state."
+        await self.send(token, reply, metadata=meta)
+
+    async def _with_threads_mode(self, token: str, msg_id: str, actor: Dict[str, Optional[str]],
+                                 text: str, room: Dict[str, Any], event_text: str) -> str:
+        """Threads mode on: arm this main-timeline turn so its reply opens a thread."""
+        if not await self._threads_mode_active(token, room):
+            return event_text
+        now = time.time()
+        self._prune_turns()
+        while len(self._thread_turns) >= THREAD_TURN_MAX:
+            self._thread_turns.pop(next(iter(self._thread_turns)))
+        name = actor.get("display_name") or actor.get("id") or "someone"
+        self._thread_turns[(token, msg_id)] = {
+            "key": (token, msg_id), "text": text, "name": name, "tid": None, "at": now,
+            "last": now, "started": False, "title": None, "done_at": None}
+        return f"{THREADS_MODE_NOTE}\n\n{event_text}"
+
+    @staticmethod
+    def _split_title_line(content: str) -> Tuple[Optional[str], str]:
+        """A leading ``Thread title: ...`` line the model was asked for, and the rest."""
+        lines = content.lstrip("\n").split("\n", 1)
+        m = _TITLE_LINE.match(lines[0])
+        if not m or not m.group(1).strip():
+            return None, content
+        return m.group(1).strip(), (lines[1] if len(lines) > 1 else "").lstrip("\n")
+
+    def _thread_title(self, given: Optional[str], human_text: str) -> str:
+        title = _clean_title(given) if given else ""
+        return title or _fallback_title(human_text)
+
+    def _prune_turns(self) -> None:
+        now = time.time()
+        for k, v in list(self._thread_turns.items()):
+            done = v.get("done_at")
+            if now - v["at"] > THREAD_TURN_TTL or (done is not None and now - done > THREAD_DONE_GRACE):
+                self._thread_turns.pop(k, None)
+
+    def _turn_for_send(self, chat_id: str, reply_to: Optional[str], has_title: bool) -> Optional[Dict[str, Any]]:
+        """The armed turn an outbound main-timeline post is positively attributed to, if any.
+
+        Only two things attribute a post: a ``reply_to`` naming the person's message,
+        or the ``Thread title:`` line (the model was only told to write it in an
+        armed turn) when exactly one armed turn in the room is still running. The
+        core gives interim commentary no turn identity, so recency never decides:
+        cron, alerts and anything else unattributed post exactly as with the mode off.
+        """
+        self._prune_turns()
+        if reply_to:
+            return self._thread_turns.get((chat_id, str(reply_to)))
+        if not has_title:
+            return None
+        live = [v for v in self._thread_turns.values()
+                if v["key"][0] == chat_id and v["started"] and v.get("done_at") is None]
+        return live[0] if len(live) == 1 else None
+
+    async def _armed_send(self, chat_id: str, content: str, reply_to: Optional[str],
+                          metadata: Optional[Dict[str, Any]]) -> Tuple[Optional[SendResult], str]:
+        """Threads mode on the send path: (a result when handled here, else the content to post).
+
+        The ``Thread title:`` line is stripped from every message of an armed turn.
+        The thread's root is the first message carrying model reply content: one
+        with a title line, or any reply once Hermes has started the turn. A
+        message anchored to the person's line before that (the core's busy or
+        interrupt acknowledgement) is posted normally and does not open a thread.
+        """
+        if not self._thread_turns or (metadata or {}).get("thread_id") or (metadata or {}).get("job_id"):
+            return None, content  # off, already in a thread, or a scheduled job's delivery
+        given, body = self._split_title_line(content)
+        turn = self._turn_for_send(chat_id, reply_to, given is not None)
+        if turn is None:
+            if given is not None and any(k[0] == chat_id for k in self._thread_turns):
+                return None, body  # an unattributable title line is still never shown
+            return None, content
+        turn["last"] = time.time()
+        if given is not None:
+            turn["title"] = _clean_title(given) or turn["title"]
+            content = body
+        if turn["tid"] is not None:
+            if not content.strip():
+                return SendResult(success=True), content
+            return await self.send(chat_id, content, metadata={"thread_id": turn["tid"]}), content
+        if not content.strip():
+            return SendResult(success=True), content  # a bare title line: keep it for the root
+        if given is None and not turn["started"]:
+            return None, content
+        started = await self._start_reply_thread(chat_id, turn, content)
+        if started is not None:
+            return started, content
+        self._thread_turns.pop(turn["key"], None)
+        return None, content
+
+    async def _start_reply_thread(self, chat_id: str, turn: Dict[str, Any],
+                                  content: str) -> Optional[SendResult]:
+        """Post *content* as the first message of a new thread; None if Talk refused it."""
+        title = turn.get("title") or _fallback_title(turn["text"])
+        chunks = _chunk_message(textstyle.tidy(content))
+        try:
+            resp = await self._http_client.post(
+                f"/ocs/v2.php/apps/spreed/api/v1/chat/{chat_id}", params={"format": "json"},
+                json={"message": chunks[0], "threadTitle": title})
+            if resp.status_code >= 300:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            tid = int(resp.json().get("ocs", {}).get("data", {}).get("id"))
+        except Exception as e:
+            logger.warning("[%s] could not open a thread in %s, replying in the main timeline: %s",
+                           self.name, chat_id, e)
+            return None
+        turn["tid"] = str(tid)
+        if len(self._thread_seed) >= THREAD_CACHE_MAX:
+            for k in list(self._thread_seed)[: THREAD_CACHE_MAX // 4]:
+                self._thread_seed.pop(k, None)
+        self._thread_seed[(chat_id, str(tid))] = f"{turn['name']}: {turn['text']}"
+        for chunk in chunks[1:]:
+            more = await self.send(chat_id, chunk, metadata={"thread_id": str(tid)})
+            if not more.success:
+                return more
+        return SendResult(success=True, message_id=str(tid))
 
     async def _attach_files(
         self, event: MessageEvent, files: List[Dict[str, Any]], message: Dict[str, Any]
@@ -2416,6 +2674,11 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
 
+        # Threads mode: the answer to a main-timeline message lives in a thread (later
+        # posts of the turn follow without replyTo, which would pull them back out).
+        handled, content = await self._armed_send(chat_id, content, reply_to, metadata)
+        if handled is not None:
+            return handled
         chunks = _chunk_message(textstyle.tidy(content))
         # Every chunk carries the thread: only the first has a replyTo (which
         # already lands in the thread), so without threadId chunks 2+ would
@@ -2467,6 +2730,15 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         """
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
+        if self._thread_turns and any(k[0] == chat_id for k in self._thread_turns):
+            given, body = self._split_title_line(content)
+            if given is not None:
+                turn = self._turn_for_send(chat_id, None, True)
+                if turn is not None:
+                    turn["title"] = _clean_title(given) or turn["title"]
+                if not body.strip():
+                    return SendResult(success=False, error="Only a thread title line, nothing to show")
+                content = body
         if len(content) > MAX_MESSAGE_LENGTH:
             return SendResult(success=False, error="Too long to edit in place")
         try:
@@ -2732,6 +3004,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         skipped (watch-mode buffering, an un-mentioned message in a
         mention-mode room, an echo of our own send).
         """
+        turn = self._thread_turns.get((getattr(event.source, "chat_id", None), str(event.message_id)))
+        if turn is not None:
+            turn["started"] = True  # replies to this message are now the model's, not a status ack
         if not self._working_reaction:
             return
         chat_id = getattr(event.source, "chat_id", None)
@@ -2742,6 +3017,14 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Remove the working-indicator reaction once processing is done, any outcome."""
+        chat = getattr(event.source, "chat_id", None)
+        # A follow-up folded into a running turn (busy_input_mode interrupt/redirect) never gets
+        # its own processing hooks: the turn that absorbed it names it, so retire it too.
+        for mid in (event.message_id, getattr(event, "reply_anchor_override", None),
+                    getattr(event, "ledger_message_id", None)):
+            turn = self._thread_turns.get((chat, str(mid))) if mid else None
+            if turn is not None and turn.get("done_at") is None:
+                turn["done_at"] = time.time()  # dropped after a short grace (see _prune_turns)
         if not self._working_reaction:
             return
         chat_id = getattr(event.source, "chat_id", None)

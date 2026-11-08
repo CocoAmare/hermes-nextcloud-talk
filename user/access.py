@@ -226,6 +226,13 @@ class TalkAccess:
             people |= {u.lower() for u in spec["users"]}
         return uid in people or uid in agents
 
+    def is_agent(self, user_id: Optional[str]) -> bool:
+        """True when the access file lists this id under ``agents:``."""
+        uid = (user_id or "").strip().lower()
+        if uid.startswith("federated_users/"):
+            uid = uid[len("federated_users/"):]
+        return self._spec is not None and uid in {a.lower() for a in self._spec["agents"]}
+
     def people(self) -> FrozenSet[str]:
         """The listed people (not agents, not room-only entries), lowercase."""
         if self._spec is None:

@@ -234,6 +234,37 @@ session and posts replies with `threadId`; bots cannot open threads here.
 Without the `threads` capability (or if the capability read fails) nothing of
 this applies and the adapter behaves exactly like 1.8.4.
 
+### Threads mode (user mode, Talk 22+)
+
+Opt-in, per room, off by default. With it on, each new message a person posts
+on the room's main timeline (a one-to-one DM included) is answered by opening
+a new thread: the reply is the thread's first message, under a short title.
+Follow-ups in that thread are their own session, as for any thread.
+
+- `/threads on`, `/threads off`, `/threads` (status) in the room. The plugin
+  handles them itself (they never reach Hermes) and only a human allowed by the
+  room's access rules may use them; another agent cannot. In a DM that is the
+  one allowed user.
+- The title: the agent is asked to start its reply with a `Thread title:` line
+  (removed from the message); if it does not, the first words of your message
+  are used, with mentions, markdown and long dashes stripped.
+- Unchanged: messages already inside a thread, slash commands, polls,
+  reactions, cron or home-channel delivery, and messages from other agents.
+- A federated room whose host does not list `threads` behaves as off; `/threads
+  on` says so.
+- Stored per profile in `<hermes home>/nctalk/threads-mode-<acct>.json`.
+  `NEXTCLOUD_TALK_THREADS_MODE_ROOMS="token1,token2"` seeds rooms that start
+  on; a stored `/threads off` beats the seed.
+- The thread opens on the first message that carries the model's reply: one
+  with the `Thread title:` line, or any reply once Hermes has started the turn.
+  The core's busy or interrupt acknowledgement stays on the main timeline. The
+  title line is removed from every message of the turn (also edits). Only a
+  post anchored to your message opens or joins the thread; commentary posted
+  while the agent works carries no turn identity from Hermes, so it stays on
+  the main timeline, as do cron and alert deliveries. A turn's state is dropped
+  when Hermes finishes it. A turn whose model skips the title line uses the
+  first words of your message.
+
 ### Polls and answer reactions (user mode)
 
 `talk_poll_create` lets the agent ask the person to pick a direction: the top
