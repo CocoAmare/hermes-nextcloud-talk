@@ -18,6 +18,7 @@ def _run(coro):
 def _adapter(tmp_path, monkeypatch, **extra):
     monkeypatch.setenv("NEXTCLOUD_TALK_STATE_DIR", str(tmp_path))
     extra.setdefault("allowed_users", "chef")
+    extra.setdefault("working_reaction", "")
     a = NextcloudTalkUserAdapter(PlatformConfig(extra=dict(extra)))
     a._threads_enabled = True
     a._capabilities_checked = True
@@ -132,7 +133,9 @@ def test_threads_command_not_forwarded_to_core(tmp_path, monkeypatch):
 
 def _ask(a, text="Plan my taxes for this year please", msg_id=10):
     _run(a._on_message("dm1", _msg(msg_id, "chef", text)))
-    return a.handled_events[-1]
+    ev = a.handled_events[-1]
+    _run(a.on_processing_start(ev))  # what the core does before the model runs
+    return ev
 
 
 def test_on_reply_opens_thread_with_model_title(tmp_path, monkeypatch):
@@ -221,3 +224,95 @@ def test_federated_host_without_threads_behaves_off(tmp_path, monkeypatch):
     assert "does not support threads" in talk.posts[-1]["message"]
     _run(a._on_message("fed1", _msg(2, "chef", "hello there")))
     assert "Threads mode" not in a.handled_events[-1].text and a._thread_turns == {}
+
+
+# -- review fixes ---------------------------------------------------------------
+
+
+def _access_file(tmp_path, monkeypatch):
+    f = tmp_path / "access.yaml"
+    f.write_text("users: [chef]\nagents: [jarvis]\n")
+    return str(f)
+
+
+def test_agent_listed_only_in_access_file_cannot_toggle(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch, access_file=_access_file(tmp_path, monkeypatch)), Talk()
+    _wire(a, talk)
+    _run(a._on_message("dm1", _msg(1, "jarvis", "/threads on")))
+    assert not a._threads_mode_stored("dm1") and a.handled_events == [] and talk.posts == []
+    _run(a._on_message("dm1", _msg(2, "chef", "/threads on")))
+    assert a._threads_mode_stored("dm1")
+
+
+def test_bot_actor_cannot_toggle(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch, allowed_users="chef,helper"), Talk()
+    _wire(a, talk)
+    _run(a._on_message("dm1", _msg(1, "helper", "/threads on", actor_type="bots")))
+    assert not a._threads_mode_stored("dm1")
+
+
+def test_gateway_authorised_user_may_toggle_without_access_file(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch, allowed_users="nobody"), Talk()
+
+    class Runner:
+        def _is_user_authorized_for_source(self, source):
+            return source.user_id == "paired"
+    a.gateway_runner = Runner()
+    _wire(a, talk)
+    _run(a._on_message("dm1", _msg(1, "paired", "/threads on")))
+    assert a._threads_mode_stored("dm1") is True
+
+
+def test_busy_ack_does_not_become_the_root_and_title_never_leaks(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    _run(a._on_message("dm1", _msg(10, "chef", "taxes")))  # armed, not yet started
+    n = len(talk.posts)
+    _run(a.send("dm1", "Busy, I will get to this next.", reply_to="10"))
+    assert talk.posts[n] == {"message": "Busy, I will get to this next.", "replyTo": 10}
+    _run(a.on_processing_start(a.handled_events[-1]))
+    res = _run(a.send("dm1", "Thread title: Taxes\nAnswer.", reply_to="10"))
+    assert talk.posts[-1] == {"message": "Answer.", "threadTitle": "Taxes"}
+    assert res.message_id == str(500 + len(talk.posts))
+
+
+def test_interim_commentary_title_stripped_and_follows_thread(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    _ask(a)
+    _run(a.send("dm1", "Thread title: Tax plan\nLet me look that up."))  # no reply_to
+    root = talk.posts[-1]
+    root_id = 500 + len(talk.posts)
+    assert root["threadTitle"] == "Tax plan" and root["message"] == "Let me look that up."
+    _run(a.send("dm1", "Checking the forms."))  # later interim, no title
+    assert talk.posts[-1]["threadId"] == root_id
+    _run(a.send("dm1", "Thread title: Tax plan\nFinal.", reply_to="10"))
+    assert talk.posts[-1]["message"] == "Final." and "threadTitle" not in talk.posts[-1]
+
+
+def test_title_only_reply_posts_nothing_and_is_kept_for_the_root(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    _ask(a)
+    n = len(talk.posts)
+    res = _run(a.send("dm1", "Thread title: Kept title", reply_to="10"))
+    assert res.success and len(talk.posts) == n
+    _run(a.send("dm1", "Body.", reply_to="10"))
+    assert talk.posts[-1] == {"message": "Body.", "threadTitle": "Kept title"}
+
+
+def test_edit_strips_title_line(tmp_path, monkeypatch):
+    a = _adapter(tmp_path, monkeypatch)
+    puts = []
+
+    def handler(request):
+        if request.method == "PUT":
+            puts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ocs": {"data": {}}})
+        return Talk()(request)
+    _wire(a, handler)
+    _run(a._on_message("dm1", _msg(1, "chef", "/threads on")))
+    _ask(a)
+    _run(a.edit_message("dm1", "77", "Thread title: T\nBody so far"))
+    assert puts[-1]["message"] == "Body so far"
+    assert not _run(a.edit_message("dm1", "77", "Thread title: T")).success

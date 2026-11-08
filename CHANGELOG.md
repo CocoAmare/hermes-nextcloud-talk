@@ -20,7 +20,9 @@ combined plugin's (`plugin.yaml` at the repo root).
   agent-to-agent messages behave as before. A federated room whose host lacks
   `threads` behaves as off. The setting is stored per profile in
   `nctalk/threads-mode-<acct>.json`; `NEXTCLOUD_TALK_THREADS_MODE_ROOMS`
-  ("token1,token2") seeds rooms that start on.
+  ("token1,token2") seeds rooms that start on. Agents listed in the access
+  file, bots and this account can never toggle; without an access file the
+  gateway's own allowed-user check decides.
 
 ## [1.13.1] - 2026-11-07
 

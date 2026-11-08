@@ -255,8 +255,12 @@ Follow-ups in that thread are their own session, as for any thread.
 - Stored per profile in `<hermes home>/nctalk/threads-mode-<acct>.json`.
   `NEXTCLOUD_TALK_THREADS_MODE_ROOMS="token1,token2"` seeds rooms that start
   on; a stored `/threads off` beats the seed.
-- Only the reply that answers a message (Hermes' reply anchor) opens the
-  thread. A stream preview posted without one stays on the main timeline.
+- The thread opens on the first message that carries the model's reply: one
+  with the `Thread title:` line, or any reply once Hermes has started the turn.
+  The core's busy or interrupt acknowledgement stays on the main timeline. The
+  title line is removed from every message of the turn (also edits), and
+  commentary the agent posts while it works follows into the thread. A turn
+  whose model skips the title line uses the first words of your message.
 
 ### Polls and answer reactions (user mode)
 
