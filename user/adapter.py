@@ -300,7 +300,7 @@ THREAD_TITLE_MAX = 200
 THREAD_FALLBACK_TITLE_WORDS = 8
 THREAD_TURN_TTL = 3600.0       # a pending "reply opens a thread" record is dropped after this
 THREAD_TURN_MAX = 200
-THREAD_FOLLOW_SECONDS = 300.0  # unanchored posts this soon after a turn's last post follow its thread
+THREAD_DONE_GRACE = 30.0       # a finished turn still answers a reply anchored to it this long
 THREADS_MODE_NOTE = (
     "[Threads mode is on for this room: your reply to this message opens a new Talk thread. "
     "Begin your reply with one line `Thread title: <3 to 8 words naming the topic>`; that line "
@@ -1842,14 +1842,13 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         if not await self._threads_mode_active(token, room):
             return event_text
         now = time.time()
-        for k in [k for k, v in self._thread_turns.items() if now - v["at"] > THREAD_TURN_TTL]:
-            self._thread_turns.pop(k, None)
+        self._prune_turns()
         while len(self._thread_turns) >= THREAD_TURN_MAX:
             self._thread_turns.pop(next(iter(self._thread_turns)))
         name = actor.get("display_name") or actor.get("id") or "someone"
         self._thread_turns[(token, msg_id)] = {
             "key": (token, msg_id), "text": text, "name": name, "tid": None, "at": now,
-            "last": now, "started": False, "title": None}
+            "last": now, "started": False, "title": None, "done_at": None}
         return f"{THREADS_MODE_NOTE}\n\n{event_text}"
 
     @staticmethod
@@ -1865,24 +1864,30 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         title = _clean_title(given) if given else ""
         return title or _fallback_title(human_text)
 
-    def _turn_for_send(self, chat_id: str, reply_to: Optional[str], has_title: bool) -> Optional[Dict[str, Any]]:
-        """The armed turn an outbound main-timeline post belongs to, if any.
+    def _prune_turns(self) -> None:
+        now = time.time()
+        for k, v in list(self._thread_turns.items()):
+            done = v.get("done_at")
+            if now - v["at"] > THREAD_TURN_TTL or (done is not None and now - done > THREAD_DONE_GRACE):
+                self._thread_turns.pop(k, None)
 
-        A post anchored to the person's message is that turn's. An unanchored one
-        (interim commentary) belongs to a turn whose thread already exists and is
-        recent, or, when it carries the title line the model was asked for, to the
-        newest turn still waiting for its thread. Anything else (cron, home
-        channel) is not ours to touch.
+    def _turn_for_send(self, chat_id: str, reply_to: Optional[str], has_title: bool) -> Optional[Dict[str, Any]]:
+        """The armed turn an outbound main-timeline post is positively attributed to, if any.
+
+        Only two things attribute a post: a ``reply_to`` naming the person's message,
+        or the ``Thread title:`` line (the model was only told to write it in an
+        armed turn) when exactly one armed turn in the room is still running. The
+        core gives interim commentary no turn identity, so recency never decides:
+        cron, alerts and anything else unattributed post exactly as with the mode off.
         """
+        self._prune_turns()
         if reply_to:
             return self._thread_turns.get((chat_id, str(reply_to)))
-        now = time.time()
-        mine = [v for v in self._thread_turns.values() if v["key"][0] == chat_id]
-        live = [v for v in mine if v["tid"] is not None and now - v["last"] < THREAD_FOLLOW_SECONDS]
-        if live:
-            return max(live, key=lambda v: v["last"])
-        waiting = [v for v in mine if v["tid"] is None]
-        return max(waiting, key=lambda v: v["at"]) if waiting and has_title else None
+        if not has_title:
+            return None
+        live = [v for v in self._thread_turns.values()
+                if v["key"][0] == chat_id and v.get("done_at") is None]
+        return live[0] if len(live) == 1 else None
 
     async def _armed_send(self, chat_id: str, content: str, reply_to: Optional[str],
                           metadata: Optional[Dict[str, Any]]) -> Tuple[Optional[SendResult], str]:
@@ -1894,11 +1899,13 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         message anchored to the person's line before that (the core's busy or
         interrupt acknowledgement) is posted normally and does not open a thread.
         """
-        if not self._thread_turns or (metadata or {}).get("thread_id"):
-            return None, content
+        if not self._thread_turns or (metadata or {}).get("thread_id") or (metadata or {}).get("job_id"):
+            return None, content  # off, already in a thread, or a scheduled job's delivery
         given, body = self._split_title_line(content)
         turn = self._turn_for_send(chat_id, reply_to, given is not None)
         if turn is None:
+            if given is not None and any(k[0] == chat_id for k in self._thread_turns):
+                return None, body  # an unattributable title line is still never shown
             return None, content
         turn["last"] = time.time()
         if given is not None:
@@ -3008,6 +3015,9 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Remove the working-indicator reaction once processing is done, any outcome."""
+        turn = self._thread_turns.get((getattr(event.source, "chat_id", None), str(event.message_id)))
+        if turn is not None:
+            turn["done_at"] = time.time()  # dropped after a short grace (see _prune_turns)
         if not self._working_reaction:
             return
         chat_id = getattr(event.source, "chat_id", None)

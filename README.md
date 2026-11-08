@@ -258,9 +258,12 @@ Follow-ups in that thread are their own session, as for any thread.
 - The thread opens on the first message that carries the model's reply: one
   with the `Thread title:` line, or any reply once Hermes has started the turn.
   The core's busy or interrupt acknowledgement stays on the main timeline. The
-  title line is removed from every message of the turn (also edits), and
-  commentary the agent posts while it works follows into the thread. A turn
-  whose model skips the title line uses the first words of your message.
+  title line is removed from every message of the turn (also edits). Only a
+  post anchored to your message opens or joins the thread; commentary posted
+  while the agent works carries no turn identity from Hermes, so it stays on
+  the main timeline, as do cron and alert deliveries. A turn's state is dropped
+  when Hermes finishes it. A turn whose model skips the title line uses the
+  first words of your message.
 
 ### Polls and answer reactions (user mode)
 

@@ -276,7 +276,7 @@ def test_busy_ack_does_not_become_the_root_and_title_never_leaks(tmp_path, monke
     assert res.message_id == str(500 + len(talk.posts))
 
 
-def test_interim_commentary_title_stripped_and_follows_thread(tmp_path, monkeypatch):
+def test_interim_commentary_title_stripped_later_interim_stays_main(tmp_path, monkeypatch):
     a, talk = _adapter(tmp_path, monkeypatch), Talk()
     _on(a, talk)
     _ask(a)
@@ -284,8 +284,8 @@ def test_interim_commentary_title_stripped_and_follows_thread(tmp_path, monkeypa
     root = talk.posts[-1]
     root_id = 500 + len(talk.posts)
     assert root["threadTitle"] == "Tax plan" and root["message"] == "Let me look that up."
-    _run(a.send("dm1", "Checking the forms."))  # later interim, no title
-    assert talk.posts[-1]["threadId"] == root_id
+    _run(a.send("dm1", "Checking the forms."))  # later interim: no turn identity, so as with mode off
+    assert talk.posts[-1] == {"message": "Checking the forms."}
     _run(a.send("dm1", "Thread title: Tax plan\nFinal.", reply_to="10"))
     assert talk.posts[-1]["message"] == "Final." and "threadTitle" not in talk.posts[-1]
 
@@ -316,3 +316,60 @@ def test_edit_strips_title_line(tmp_path, monkeypatch):
     _run(a.edit_message("dm1", "77", "Thread title: T\nBody so far"))
     assert puts[-1]["message"] == "Body so far"
     assert not _run(a.edit_message("dm1", "77", "Thread title: T")).success
+
+
+# -- round 2: attribution, overlap, completion --------------------------------
+
+
+def test_cron_and_unattributed_sends_never_enter_a_thread(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    _ask(a)
+    _run(a.send("dm1", "Thread title: Taxes\nAnswer.", reply_to="10"))
+    _run(a.send("dm1", "CRON: disk 91% full", metadata={"job_id": "j1"}))
+    assert talk.posts[-1] == {"message": "CRON: disk 91% full"}
+    _run(a.send("dm1", "plain alert"))
+    assert talk.posts[-1] == {"message": "plain alert"}
+    # even a cron post that happens to start with a title line is untouched
+    _run(a.send("dm1", "Thread title: x\nbody", metadata={"job_id": "j1"}))
+    assert talk.posts[-1] == {"message": "Thread title: x\nbody"}
+
+
+def test_overlapping_turns_each_get_their_own_thread_and_title(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    _ask(a, "taxes", msg_id=10)
+    _ask(a, "car", msg_id=11)
+    r1 = _run(a.send("dm1", "Thread title: Taxes\nT answer", reply_to="10"))
+    # commentary of turn 2 with two live turns cannot be attributed: stripped, main timeline
+    _run(a.send("dm1", "Thread title: Car\nChecking car."))
+    assert talk.posts[-1] == {"message": "Checking car."}
+    r2 = _run(a.send("dm1", "Thread title: Car\nC answer", reply_to="11"))
+    assert talk.posts[-1] == {"message": "C answer", "threadTitle": "Car"}
+    assert r1.message_id != r2.message_id
+    _run(a.send("dm1", "T more", reply_to="10"))
+    assert talk.posts[-1] == {"message": "T more", "threadId": int(r1.message_id)}
+
+
+def test_completion_drops_the_turn_after_grace(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    ev = _ask(a)
+    _run(a.send("dm1", "Thread title: T\nA", reply_to="10"))
+    from gateway.platforms.base import ProcessingOutcome
+    _run(a.on_processing_complete(ev, ProcessingOutcome.SUCCESS))
+    _run(a.send("dm1", "late final", reply_to="10"))  # inside the grace: still the thread's
+    assert "threadId" in talk.posts[-1]
+    a._thread_turns[("dm1", "10")]["done_at"] -= 60
+    _run(a.send("dm1", "after", reply_to="10"))
+    assert talk.posts[-1] == {"message": "after", "replyTo": 10}
+    assert a._thread_turns == {}
+
+
+def test_ttl_backstop_drops_a_turn_that_never_completes(tmp_path, monkeypatch):
+    a, talk = _adapter(tmp_path, monkeypatch), Talk()
+    _on(a, talk)
+    _ask(a)
+    a._thread_turns[("dm1", "10")]["at"] -= 7200
+    _run(a.send("dm1", "late", reply_to="10"))
+    assert talk.posts[-1] == {"message": "late", "replyTo": 10} and a._thread_turns == {}
