@@ -678,8 +678,7 @@ def test_inbound_event_carries_no_adapter_metadata():
     assert adapter.handled_events[0].metadata == {}
 
 
-def test_secret_falls_back_to_env_without_hermes_secret_scope(monkeypatch):
-    monkeypatch.setattr(user_adapter, "_hermes_get_secret", None)
+def test_secret_reads_env_via_shared_helper(monkeypatch):
     monkeypatch.setenv("NEXTCLOUD_TALK_APP_PASSWORD", "from-env")
     assert user_adapter._secret("NEXTCLOUD_TALK_APP_PASSWORD") == "from-env"
 

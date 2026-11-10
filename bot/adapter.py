@@ -43,7 +43,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import socket as _socket
 from typing import Any, Dict, List, Optional
 
@@ -64,18 +63,13 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 # replace each other. Env var names keep the NEXTCLOUD_TALK_ prefix.
 PLATFORM_NAME = "nctalk"
 
-try:  # Hermes resolves credentials per profile scope (multiplexed gateways)
-    from agent.secret_scope import get_secret as _hermes_get_secret
-except ImportError:  # pragma: no cover - older Hermes / test stubs
-    _hermes_get_secret = None
+from gateway.platforms._shared import get_scoped_secret as _hermes_get_secret
 
 
-def _secret(name: str, default: str = "") -> str:
-    """Read a credential through Hermes' secret scope, falling back to the env."""
-    if _hermes_get_secret is not None:
-        val = _hermes_get_secret(name, default)
-        return default if val is None else val
-    return os.getenv(name, default)
+def _secret(name: str, default: Any = "") -> Any:
+    """Use Hermes' default-profile startup fallback without crossing profile scopes."""
+    val = _hermes_get_secret(name, default)
+    return default if val is None else val
 
 
 try:  # drop-in plugin layout: core.py is this file's sibling in the
@@ -161,10 +155,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._base_url = str(extra.get("base_url") or "").rstrip("/")
         self._rooms_cfg: Dict[str, Any] = extra.get("rooms") or {}
         self._allowed_users = parse_allowlist(
-            extra.get("allowed_users") or os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
+            extra.get("allowed_users") or _secret("NEXTCLOUD_TALK_ALLOWED_USERS", "")
         )
         self._allow_all_users = str(
-            extra.get("allow_all_users") or os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
+            extra.get("allow_all_users") or _secret("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
         ).strip().lower() in ("1", "true", "yes", "on")
         self._triggers = extra.get("mention_triggers") or ["jarvis"]
         self._context_max_messages = int(extra.get("context_window_messages", 40))
@@ -615,7 +609,7 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     secret = _secret("NEXTCLOUD_TALK_SECRET") or extra.get("secret")
-    base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL") or extra.get("base_url")
+    base_url = _secret("NEXTCLOUD_TALK_BASE_URL") or extra.get("base_url")
     return bool(secret and base_url)
 
 
@@ -625,37 +619,38 @@ def _env_enablement() -> Optional[dict]:
     vars directly in __init__ before the plugin env_enablement_fn hook
     existed -- see PLAN.md section 4 for the env var semantics)."""
     secret = _secret("NEXTCLOUD_TALK_SECRET", "").strip()
-    base_url = os.getenv("NEXTCLOUD_TALK_BASE_URL", "").strip()
+    base_url = _secret("NEXTCLOUD_TALK_BASE_URL", "").strip()
     if not (secret and base_url):
         return None
     seed: Dict[str, Any] = {"secret": secret, "base_url": base_url}
-    host = os.getenv("NEXTCLOUD_TALK_HOST", "").strip()
+    host = _secret("NEXTCLOUD_TALK_HOST", "").strip()
     if host:
         seed["host"] = host
-    port = os.getenv("NEXTCLOUD_TALK_PORT", "").strip()
+    port = _secret("NEXTCLOUD_TALK_PORT", "").strip()
     if port:
         try:
             seed["port"] = int(port)
         except ValueError:
             logger.warning("[NextcloudTalk] NEXTCLOUD_TALK_PORT=%r is not an int, ignoring", port)
-    path = os.getenv("NEXTCLOUD_TALK_PATH", "").strip()
+    path = _secret("NEXTCLOUD_TALK_PATH", "").strip()
     if path:
         seed["path"] = path
-    rooms_json = os.getenv("NEXTCLOUD_TALK_ROOMS_JSON", "").strip()
+    rooms_json = _secret("NEXTCLOUD_TALK_ROOMS_JSON", "").strip()
     if rooms_json:
         try:
             seed["rooms"] = json.loads(rooms_json)
         except json.JSONDecodeError:
             logger.warning("[NextcloudTalk] NEXTCLOUD_TALK_ROOMS_JSON is not valid JSON, ignoring")
-    triggers = os.getenv("NEXTCLOUD_TALK_MENTION_TRIGGERS", "").strip()
+    triggers = _secret("NEXTCLOUD_TALK_MENTION_TRIGGERS", "").strip()
     if triggers:
         seed["mention_triggers"] = [t.strip() for t in triggers.split(",") if t.strip()]
     # Presence check, not truthiness: NEXTCLOUD_TALK_WORKING_REACTION="" must seed
     # "" (explicitly disables the reaction, per adapter.py's __init__ comment) --
     # that's different from the var being unset at all (keeps the 👀 default).
-    if "NEXTCLOUD_TALK_WORKING_REACTION" in os.environ:
-        seed["working_reaction"] = os.environ["NEXTCLOUD_TALK_WORKING_REACTION"].strip()
-    done_reaction = os.getenv("NEXTCLOUD_TALK_DONE_REACTION", "").strip()
+    working_reaction = _secret("NEXTCLOUD_TALK_WORKING_REACTION", None)
+    if working_reaction is not None:
+        seed["working_reaction"] = working_reaction.strip()
+    done_reaction = _secret("NEXTCLOUD_TALK_DONE_REACTION", "").strip()
     if done_reaction:
         seed["done_reaction"] = done_reaction
     return seed

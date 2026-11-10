@@ -36,15 +36,16 @@ and ``user/__init__.py``) if you only want one of the two and would rather
 not deploy the other's files at all.
 """
 
-import os
 from typing import Any, Dict, Optional
+
+from gateway.platforms._shared import get_scoped_secret
 
 from .bot import adapter as _bot
 from .user import adapter as _user
 
 
 def _mode(config) -> Optional[str]:
-    override = os.getenv("NEXTCLOUD_TALK_MODE", "").strip().lower()
+    override = get_scoped_secret("NEXTCLOUD_TALK_MODE", "").strip().lower()
     if override in ("bot", "user"):
         return override
 

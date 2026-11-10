@@ -64,7 +64,6 @@ so neither applies there).
 import asyncio
 import base64
 import logging
-import os
 import re
 import time
 from datetime import datetime, timezone
@@ -83,18 +82,14 @@ from gateway.config import Platform, PlatformConfig
 # replace each other. Env var names keep the NEXTCLOUD_TALK_ prefix.
 PLATFORM_NAME = "nctalk"
 
-try:  # Hermes resolves credentials per profile scope (multiplexed gateways)
-    from agent.secret_scope import get_secret as _hermes_get_secret
-except ImportError:  # pragma: no cover - older Hermes / test stubs
-    _hermes_get_secret = None
+from gateway.platforms._shared import get_scoped_secret as _hermes_get_secret
+from gateway.platforms._shared import seed_extra_from_env
 
 
-def _secret(name: str, default: str = "") -> str:
-    """Read a credential through Hermes' secret scope, falling back to the env."""
-    if _hermes_get_secret is not None:
-        val = _hermes_get_secret(name, default)
-        return default if val is None else val
-    return os.getenv(name, default)
+def _secret(name: str, default: Any = "") -> Any:
+    """Use Hermes' default-profile startup fallback without crossing profile scopes."""
+    val = _hermes_get_secret(name, default)
+    return default if val is None else val
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -509,14 +504,14 @@ def check_requirements() -> bool:
     """Minimal env check used by the plugin registry pre-flight."""
     if not HTTPX_AVAILABLE:
         return False
-    server = os.getenv("NEXTCLOUD_TALK_SERVER_URL", "").strip()
+    server = _secret("NEXTCLOUD_TALK_SERVER_URL", "").strip()
     app_password = _secret("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
     return bool(server and app_password)
 
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    server = extra.get("server_url") or os.getenv("NEXTCLOUD_TALK_SERVER_URL", "")
+    server = extra.get("server_url") or _secret("NEXTCLOUD_TALK_SERVER_URL", "")
     app_password = extra.get("app_password") or _secret("NEXTCLOUD_TALK_APP_PASSWORD", "")
     return bool(server and app_password)
 
@@ -541,12 +536,12 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
 
         extra = config.extra or {}
         self._server: str = (
-            extra.get("server_url") or os.getenv("NEXTCLOUD_TALK_SERVER_URL", "")
+            extra.get("server_url") or _secret("NEXTCLOUD_TALK_SERVER_URL", "")
         ).rstrip("/")
-        self._username: str = extra.get("username") or os.getenv(
+        self._username: str = extra.get("username") or _secret(
             "NEXTCLOUD_TALK_USERNAME", DEFAULT_USERNAME
         )
-        self._display_name: str = extra.get("display_name") or os.getenv(
+        self._display_name: str = extra.get("display_name") or _secret(
             "NEXTCLOUD_TALK_DISPLAY_NAME", DEFAULT_DISPLAY_NAME
         )
         self._app_password: str = extra.get("app_password") or _secret("NEXTCLOUD_TALK_APP_PASSWORD", ""
@@ -555,32 +550,32 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
             s.strip()
             for s in (
                 extra.get("allowed_inviters")
-                or os.getenv("NEXTCLOUD_TALK_ALLOWED_INVITERS", "")
+                or _secret("NEXTCLOUD_TALK_ALLOWED_INVITERS", "")
             ).split(",")
             if s.strip()
         ]
         self._room_modes: Dict[str, str] = _parse_room_modes_env(
-            extra.get("room_modes") or os.getenv("NEXTCLOUD_TALK_ROOM_MODES", "")
+            extra.get("room_modes") or _secret("NEXTCLOUD_TALK_ROOM_MODES", "")
         )
         self._agent_users: frozenset = _parse_agent_users(
-            extra.get("agent_users") or os.getenv(AGENT_USERS_ENV, "")
+            extra.get("agent_users") or _secret(AGENT_USERS_ENV, "")
         )
         self._agent_chain_limit: int = int(
             extra.get("agent_chain_limit")
-            or os.getenv(AGENT_CHAIN_LIMIT_ENV, DEFAULT_AGENT_CHAIN_LIMIT)
+            or _secret(AGENT_CHAIN_LIMIT_ENV, DEFAULT_AGENT_CHAIN_LIMIT)
         )
         self._context_messages: int = int(
             extra.get("context_messages")
             if extra.get("context_messages") is not None
-            else os.getenv(CONTEXT_MESSAGES_ENV, DEFAULT_CONTEXT_MESSAGES)
+            else _secret(CONTEXT_MESSAGES_ENV, DEFAULT_CONTEXT_MESSAGES)
         )
         self._room_rules_all: bool = _truthy(
-            extra.get("room_rules_all_rooms") or os.getenv(ROOM_RULES_ALL_ENV, "")
+            extra.get("room_rules_all_rooms") or _secret(ROOM_RULES_ALL_ENV, "")
         )
         # Read at adapter start, not import, so it is correct per profile.
         self._long_poll_timeout: int = int(
             extra.get("long_poll_timeout")
-            or os.getenv(LONG_POLL_TIMEOUT_ENV, DEFAULT_LONG_POLL_TIMEOUT)
+            or _secret(LONG_POLL_TIMEOUT_ENV, DEFAULT_LONG_POLL_TIMEOUT)
         )
         # room token -> unanswered "name: text" lines since the agent last replied
         self._room_context: Dict[str, List[str]] = {}
@@ -588,14 +583,14 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         self._agent_chain: Dict[str, int] = {}
         self._discovery_interval: float = float(
             extra.get("discovery_interval_seconds")
-            or os.getenv("NEXTCLOUD_TALK_DISCOVERY_INTERVAL_SECONDS", DEFAULT_DISCOVERY_INTERVAL)
+            or _secret("NEXTCLOUD_TALK_DISCOVERY_INTERVAL_SECONDS", DEFAULT_DISCOVERY_INTERVAL)
         )
         self._max_rooms: int = int(
-            extra.get("max_rooms") or os.getenv("NEXTCLOUD_TALK_MAX_ROOMS", DEFAULT_MAX_ROOMS)
+            extra.get("max_rooms") or _secret("NEXTCLOUD_TALK_MAX_ROOMS", DEFAULT_MAX_ROOMS)
         )
         _working_reaction_raw = extra.get("working_reaction")
         if _working_reaction_raw is None:
-            _working_reaction_raw = os.environ.get(WORKING_REACTION_ENV)
+            _working_reaction_raw = _secret(WORKING_REACTION_ENV, None)
         self._working_reaction: str = _working_reaction_emoji(_working_reaction_raw)
 
         self._http_client: Optional["httpx.AsyncClient"] = None
@@ -608,10 +603,10 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
         # Watch digests are filtered against the same allowlist the gateway
         # applies, so an unlisted sender's text never rides in on a digest.
         self._allowed_users = _parse_allowlist(
-            extra.get("allowed_users") or os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
+            extra.get("allowed_users") or _secret("NEXTCLOUD_TALK_ALLOWED_USERS", "")
         )
         self._allow_all_users = _truthy(
-            extra.get("allow_all_users") or os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
+            extra.get("allow_all_users") or _secret("NEXTCLOUD_TALK_ALLOW_ALL_USERS", "")
         )
 
     # -- Connection lifecycle -------------------------------------------
@@ -1131,22 +1126,20 @@ class NextcloudTalkUserAdapter(BasePlatformAdapter):
 
 
 def _env_enablement() -> Optional[dict]:
-    server = os.getenv("NEXTCLOUD_TALK_SERVER_URL", "").strip()
+    server = _secret("NEXTCLOUD_TALK_SERVER_URL", "").strip()
     app_password = _secret("NEXTCLOUD_TALK_APP_PASSWORD", "").strip()
     if not server or not app_password:
         return None
-    seed: dict = {
-        "server_url": server.rstrip("/"),
-        "username": os.getenv("NEXTCLOUD_TALK_USERNAME", DEFAULT_USERNAME),
-        "display_name": os.getenv("NEXTCLOUD_TALK_DISPLAY_NAME", DEFAULT_DISPLAY_NAME),
-    }
-    home = os.getenv("NEXTCLOUD_TALK_HOME_CHANNEL", "").strip()
-    if home:
-        seed["home_channel"] = {
-            "chat_id": home,
-            "name": os.getenv("NEXTCLOUD_TALK_HOME_CHANNEL_NAME", home),
-        }
-    return seed
+    # The gateway updates explicit extras with this result. Never seed defaults:
+    # an absent identity env var must leave this profile's YAML identity intact.
+    return seed_extra_from_env(
+        (
+            ("NEXTCLOUD_TALK_SERVER_URL", "server_url", lambda value: value.rstrip("/")),
+            ("NEXTCLOUD_TALK_USERNAME", "username", None),
+            ("NEXTCLOUD_TALK_DISPLAY_NAME", "display_name", None),
+        ),
+        home_env="NEXTCLOUD_TALK_HOME_CHANNEL",
+    )
 
 
 async def _standalone_send(
@@ -1163,8 +1156,8 @@ async def _standalone_send(
         return {"error": "nctalk standalone send: httpx not installed"}
 
     extra = getattr(pconfig, "extra", {}) or {}
-    server = (extra.get("server_url") or os.getenv("NEXTCLOUD_TALK_SERVER_URL", "")).rstrip("/")
-    username = extra.get("username") or os.getenv("NEXTCLOUD_TALK_USERNAME", DEFAULT_USERNAME)
+    server = (extra.get("server_url") or _secret("NEXTCLOUD_TALK_SERVER_URL", "")).rstrip("/")
+    username = extra.get("username") or _secret("NEXTCLOUD_TALK_USERNAME", DEFAULT_USERNAME)
     app_password = extra.get("app_password") or _secret("NEXTCLOUD_TALK_APP_PASSWORD", "")
     if not server or not app_password:
         return {"error": "nctalk standalone send: not configured"}
